@@ -1,9 +1,9 @@
-﻿using System;
-using System.Collections;
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
@@ -11,236 +11,170 @@ using StackExchange.Profiling.MongoDB.Utils;
 
 namespace StackExchange.Profiling.MongoDB
 {
-    public class ProfiledMongoCollection<TDefaultDocument> : MongoCollection<TDefaultDocument>
+    public class ProfiledMongoCollection<TDefaultDocument> : IMongoCollection<TDefaultDocument>
     {
-        public ProfiledMongoCollection(MongoDatabase database, string name, MongoCollectionSettings settings) : base(database, name, settings)
+        private readonly IMongoCollection<TDefaultDocument> _collection;
+
+        public ProfiledMongoCollection(IMongoCollection<TDefaultDocument> collection)
         {
+            _collection = collection;
         }
 
-        public override MongoCursor<TDocument> FindAs<TDocument>(IMongoQuery query)
+        public async Task<IAsyncCursor<TResult>> AggregateAsync<TResult>(PipelineDefinition<TDefaultDocument, TResult> pipeline, AggregateOptions options = null,
+                                            CancellationToken cancellationToken = new CancellationToken())
         {
-            var serializer = BsonSerializer.LookupSerializer(typeof(TDocument));
-            return new ProfiledMongoCursor<TDocument>(this, query, Settings.ReadPreference, serializer, null);
+            var source = await _collection.AggregateAsync(pipeline, options, cancellationToken);
+            return new ProfiledMongoCursor<TDefaultDocument, TResult>(source, this, null, null, null, 0, 0);
         }
 
-        public override IEnumerable<BsonDocument> Aggregate(AggregateArgs args)
+        public async Task<BulkWriteResult<TDefaultDocument>> BulkWriteAsync(IEnumerable<WriteModel<TDefaultDocument>> requests, BulkWriteOptions options = null, CancellationToken cancellationToken = new CancellationToken())
         {
             var sw = new Stopwatch();
 
             sw.Start();
-            var underlyingEnumerable = base.Aggregate(args);
+            var result = await _collection.BulkWriteAsync(requests, options, cancellationToken);
             sw.Stop();
 
-            var profiledEnumerable = new ProfiledEnumerable<BsonDocument>(underlyingEnumerable);
+            string commandString = string.Format("db.{0}.bulkWrite(requests, options)", Name);
 
-            sw.Start();
-            var profiledEnumerator = (ProfiledEnumerator<BsonDocument>) profiledEnumerable.GetEnumerator();
-            sw.Stop();
+            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Create);
 
-            profiledEnumerator.EnumerationEnded += (sender, eventArgs) =>
-            {
-                var operationsList = args.Pipeline.ToList();
-
-                string commandString = string.Format("db.{0}.aggregate(pipeline)\n\npipeline = \n{1}", Name,
-                    string.Join("\n", operationsList.Select(operation => string.Format("   {0}", operation))));
-
-                ProfilerUtils.AddMongoTiming(commandString, (long) (eventArgs.Elapsed + sw.Elapsed).TotalMilliseconds,
-                    ExecuteType.Read);
-            };
-
-            return profiledEnumerable;
+            return result;
         }
 
-        [Obsolete("Use the overload with an AggregateArgs parameter.")]
-        public override AggregateResult Aggregate(IEnumerable<BsonDocument> operations)
+        public async Task<long> CountAsync(FilterDefinition<TDefaultDocument> filter, CountOptions options = null, CancellationToken cancellationToken = new CancellationToken())
         {
-            var operationsList = operations.ToList();
-
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.Aggregate(operationsList);
+            var result = await _collection.CountAsync(filter, options, cancellationToken);
             sw.Stop();
 
-            string commandString = string.Format("db.{0}.aggregate(pipeline)\n\npipeline = \n{1}", Name,
-                string.Join("\n", operationsList.Select(operation => string.Format("   {0}", operation))));
+            string commandString = filter != null
+                ? string.Format("db.{0}.count(query)\n\nquery = {1}", _collection.CollectionNamespace.CollectionName, RenderFilter(filter))
+                : string.Format("db.{0}.count()", _collection.CollectionNamespace.CollectionName);
 
             ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Read);
 
             return result;
         }
 
-        public override long Count(IMongoQuery query)
+        private string RenderFilter(FilterDefinition<TDefaultDocument> filter)
         {
-            var sw = new Stopwatch();
-
-            sw.Start();
-            var result = base.Count(query);
-            sw.Stop();
-
-            string commandString = query != null
-                ? string.Format("db.{0}.count(query)\n\nquery = {1}", Name, query)
-                : string.Format("db.{0}.count()", Name);
-
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Read);
-
-            return result;
+            var documentSerializer = BsonSerializer.SerializerRegistry.GetSerializer<TDefaultDocument>();
+            return filter.Render(documentSerializer, BsonSerializer.SerializerRegistry).ToJson();
         }
 
-        public override IEnumerable<BsonValue> Distinct(string key, IMongoQuery query)
+        public async Task<DeleteResult> DeleteManyAsync(FilterDefinition<TDefaultDocument> filter, CancellationToken cancellationToken = new CancellationToken())
         {
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.Distinct(key, query);
-            sw.Stop();
-
-            string commandString = query != null
-                ? string.Format("db.{0}.distinct(\"{1}\", query)\n\nquery = {2}", Name, key, query)
-                : string.Format("db.{0}.distinct(\"{1}\")", Name, key);
-
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Read);
-
-            return result;
-        }
-
-        public override IEnumerable<TValue> Distinct<TValue>(string key, IMongoQuery query)
-        {
-            var sw = new Stopwatch();
-
-            sw.Start();
-            var result = base.Distinct<TValue>(key, query);
-            sw.Stop();
-
-            string commandString = query != null
-                ? string.Format("db.{0}.distinct(\"{1}\", query)\n\nquery = {2}", Name, key, query)
-                : string.Format("db.{0}.distinct(\"{1}\")", Name, key);
-
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Read);
-
-            return result;
-        }
-
-        public override CommandResult Drop()
-        {
-            var sw = new Stopwatch();
-
-            sw.Start();
-            var result = base.Drop();
-            sw.Stop();
-
-            string commandString = string.Format("db.{0}.drop()", Name);
-
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Command);
-
-            return result;
-        }
-
-        public override CommandResult DropIndexByName(string indexName)
-        {
-            var sw = new Stopwatch();
-
-            sw.Start();
-            var result = base.DropIndexByName(indexName);
-            sw.Stop();
-
-            string commandString = string.Format("db.{0}.dropIndex(\"{1}\")", Name, indexName);
-
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Command);
-
-            return result;
-        }
-
-        public override WriteConcernResult CreateIndex(IMongoIndexKeys keys, IMongoIndexOptions options)
-        {
-            var sw = new Stopwatch();
-
-            sw.Start();
-            var result = base.CreateIndex(keys, options);
-            sw.Stop();
-
-            string commandString = options != null
-                ? string.Format("db.{0}.ensureIndex(keys, options)\n\nkeys = {1}\n\noptions = {2}", Name, keys.ToBsonDocument(), options.ToBsonDocument())
-                : string.Format("db.{0}.ensureIndex(keys, options)\n\nkeys = {1}", Name, keys.ToBsonDocument());
-
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Command);
-
-            return result;
-        }
-
-        #region FindAndModify
-
-        public override FindAndModifyResult FindAndModify(FindAndModifyArgs args)
-        {
-            var sw = new Stopwatch();
-
-            sw.Start();
-            var result = base.FindAndModify(args);
+            var result = await _collection.DeleteManyAsync(filter, cancellationToken);
             sw.Stop();
 
             var commandStringBuilder = new StringBuilder(1024);
-            commandStringBuilder.AppendFormat("db.{0}.findAndModify(query, sort, update, new, fields, upsert)", Name);
 
-            if (args.Query != null)
-                commandStringBuilder.AppendFormat("\nquery = {0}", args.Query.ToBsonDocument());
-            else
-                commandStringBuilder.Append("\nquery = null");
+            commandStringBuilder.AppendFormat("db.{0}.remove", Name);
 
-            if (args.SortBy != null)
-                commandStringBuilder.AppendFormat("\nsort = {0}", args.SortBy.ToBsonDocument());
-            else
-                commandStringBuilder.Append("\nsort = null");
+            if (filter != null)
+            {
+                commandStringBuilder.Append("(");
+                commandStringBuilder.AppendFormat("query");
+                
+                commandStringBuilder.Append(")");
 
-            if (args.Update != null)
-                commandStringBuilder.AppendFormat("\nupdate = {0}", args.Update.ToBsonDocument());
-            else
-                commandStringBuilder.Append("\nupdate = null");
-
-            commandStringBuilder.AppendFormat("\nnew = {0}", args.VersionReturned == FindAndModifyDocumentVersion.Modified ? "true" : "false");
-
-            if (args.Fields != null)
-                commandStringBuilder.AppendFormat("\nfields = {0}", args.Fields.ToBsonDocument());
-            else
-                commandStringBuilder.Append("\nfields = null");
-
-            commandStringBuilder.AppendFormat("\nupsert = {0}", args.Upsert ? "true" : "false");
+                commandStringBuilder.AppendFormat("\nquery = {0}", filter.ToBsonDocument());
+            }
 
             string commandString = commandStringBuilder.ToString();
 
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Update);
+            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Create);
 
             return result;
         }
 
-        #endregion
-
-        #region FindAndRemove
-
-        public override FindAndModifyResult FindAndRemove(FindAndRemoveArgs args)
+        public async Task<DeleteResult> DeleteOneAsync(FilterDefinition<TDefaultDocument> filter, CancellationToken cancellationToken = new CancellationToken())
         {
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.FindAndRemove(args);
+            var result = await _collection.DeleteManyAsync(filter, cancellationToken);
+            sw.Stop();
+
+            var commandStringBuilder = new StringBuilder(1024);
+
+            commandStringBuilder.AppendFormat("db.{0}.remove", Name);
+
+            if (filter != null)
+            {
+                commandStringBuilder.Append("(");
+                commandStringBuilder.AppendFormat("query");
+
+                commandStringBuilder.Append(", true");
+
+                commandStringBuilder.Append(")");
+
+                commandStringBuilder.AppendFormat("\nquery = {0}", filter.ToBsonDocument());
+            }
+            else
+            {
+                commandStringBuilder.Append("({}, true)");
+            }
+
+            string commandString = commandStringBuilder.ToString();
+
+            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Create);
+
+            return result;
+        }
+
+
+        public async Task<IAsyncCursor<TField>> DistinctAsync<TField>(FieldDefinition<TDefaultDocument, TField> field, FilterDefinition<TDefaultDocument> filter, DistinctOptions options = null,
+                                          CancellationToken cancellationToken = new CancellationToken())
+        {
+            var source = await _collection.DistinctAsync(field, filter, options, cancellationToken);
+            return new ProfiledMongoCursor<TDefaultDocument, TField>(source, this, filter, null, null, 0, 0);
+        }
+
+        public async Task<IAsyncCursor<TProjection>> FindAsync<TProjection>(FilterDefinition<TDefaultDocument> filter, FindOptions<TDefaultDocument, TProjection> options = null, CancellationToken cancellationToken = new CancellationToken())
+        {
+            var source = await _collection.FindAsync(filter, options, cancellationToken);
+
+            if (options == null)
+            {
+                options = new FindOptions<TDefaultDocument, TProjection>();
+            }
+
+            return new ProfiledMongoCursor<TDefaultDocument, TProjection>(source, this, filter, null, options.Sort, options.Skip, options.Limit);
+        }
+
+        public async Task<TProjection> FindOneAndDeleteAsync<TProjection>(FilterDefinition<TDefaultDocument> filter, FindOneAndDeleteOptions<TDefaultDocument, TProjection> options = null,
+                                                       CancellationToken cancellationToken = new CancellationToken())
+        {
+            var sw = new Stopwatch();
+
+            sw.Start();
+            var result = await _collection.FindOneAndDeleteAsync(filter, options, cancellationToken);
             sw.Stop();
 
             var commandStringBuilder = new StringBuilder(1024);
             commandStringBuilder.AppendFormat("db.{0}.findAndModify(query, sort, remove, fields)", Name);
 
-            if (args.Query != null)
-                commandStringBuilder.AppendFormat("\nquery = {0}", args.Query.ToBsonDocument());
+            if (filter != null)
+                commandStringBuilder.AppendFormat("\nquery = {0}", filter.ToBsonDocument());
             else
                 commandStringBuilder.Append("\nquery = null");
 
-            if (args.SortBy != null)
-                commandStringBuilder.AppendFormat("\nsort = {0}", args.SortBy.ToBsonDocument());
+            if (options.Sort != null)
+                commandStringBuilder.AppendFormat("\nsort = {0}", options.Sort.ToBsonDocument());
             else
                 commandStringBuilder.Append("\nsort = null");
 
             commandStringBuilder.AppendFormat("\nremove = true");
 
-            if (args.Fields != null)
-                commandStringBuilder.AppendFormat("\nfields = {0}", args.Fields.ToBsonDocument());
+            if (options.Projection != null)
+                commandStringBuilder.AppendFormat("\nfields = {0}", options.Projection.ToBsonDocument());
             else
                 commandStringBuilder.Append("\nfields = null");
 
@@ -251,110 +185,118 @@ namespace StackExchange.Profiling.MongoDB
             return result;
         }
 
-        #endregion
-
-        #region Group
-
-        public override IEnumerable<BsonDocument> Group(IMongoQuery query, IMongoGroupBy keys, BsonDocument initial, BsonJavaScript reduce, BsonJavaScript finalize)
+        public async Task<TProjection> FindOneAndReplaceAsync<TProjection>(FilterDefinition<TDefaultDocument> filter, TDefaultDocument replacement, FindOneAndReplaceOptions<TDefaultDocument, TProjection> options = null,
+                                                        CancellationToken cancellationToken = new CancellationToken())
         {
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.Group(query, keys, initial, reduce, finalize);
+            var result = await _collection.FindOneAndReplaceAsync(filter, replacement, options, cancellationToken);
             sw.Stop();
 
             var commandStringBuilder = new StringBuilder(1024);
+            commandStringBuilder.AppendFormat("db.{0}.findAndModify(query, sort, update, new, fields, upsert)", Name);
 
-            commandStringBuilder.AppendFormat("db.{0}.group({{key, reduce, initial", Name);
+            if (filter != null)
+                commandStringBuilder.AppendFormat("\nquery = {0}", filter.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nquery = null");
 
-            if (query != null)
-                commandStringBuilder.Append(", cond");
+            if (options.Sort != null)
+                commandStringBuilder.AppendFormat("\nsort = {0}", options.Sort.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nsort = null");
+            
+            if (options.Projection != null)
+                commandStringBuilder.AppendFormat("\nfields = {0}", options.Projection.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nfields = null");
 
-            if (initial != null)
-                commandStringBuilder.Append(", initial");
-
-            if (finalize != null)
-                commandStringBuilder.Append(", finalize");
-
-            commandStringBuilder.Append("})");
-
-            commandStringBuilder.AppendFormat("\nkey = {0}", keys.ToBsonDocument());
-
-            commandStringBuilder.Append("\nreduce = javascript");
-
-            commandStringBuilder.AppendFormat("\ninitial = {0}", initial.ToBsonDocument());
-
-            if (query != null)
-                commandStringBuilder.AppendFormat("\ncond = {0}", query.ToBsonDocument());
-
-            if (initial != null)
-                commandStringBuilder.AppendFormat("\ninitial = {0}", initial.ToBsonDocument());
-
-            if (finalize != null)
-                commandStringBuilder.Append("\nfinalize = javascript");
+            commandStringBuilder.AppendFormat("\nupsert = {0}", options.IsUpsert ? "true" : "false");
 
             string commandString = commandStringBuilder.ToString();
 
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Read);
+            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Update);
 
             return result;
         }
 
-        public override IEnumerable<BsonDocument> Group(IMongoQuery query, BsonJavaScript keyFunction, BsonDocument initial, BsonJavaScript reduce, BsonJavaScript finalize)
+        public async Task<TProjection> FindOneAndUpdateAsync<TProjection>(FilterDefinition<TDefaultDocument> filter, UpdateDefinition<TDefaultDocument> update, FindOneAndUpdateOptions<TDefaultDocument, TProjection> options = null,
+                                                       CancellationToken cancellationToken = new CancellationToken())
         {
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.Group(query, keyFunction, initial, reduce, finalize);
+            var result = await _collection.FindOneAndUpdateAsync(filter, update, options, cancellationToken);
             sw.Stop();
 
             var commandStringBuilder = new StringBuilder(1024);
+            commandStringBuilder.AppendFormat("db.{0}.findAndModify(query, sort, update, new, fields, upsert)", Name);
 
-            commandStringBuilder.AppendFormat("db.{0}.group({{keyf, reduce, initial", Name);
+            if (filter != null)
+                commandStringBuilder.AppendFormat("\nquery = {0}", filter.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nquery = null");
 
-            if (query != null)
-                commandStringBuilder.Append(", cond");
+            if (options.Sort != null)
+                commandStringBuilder.AppendFormat("\nsort = {0}", options.Sort.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nsort = null");
 
-            if (initial != null)
-                commandStringBuilder.Append(", initial");
+            if (update != null)
+                commandStringBuilder.AppendFormat("\nupdate = {0}", update.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nupdate = null");
 
-            if (finalize != null)
-                commandStringBuilder.Append(", finalize");
+            if (options.Projection != null)
+                commandStringBuilder.AppendFormat("\nfields = {0}", options.Projection.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nfields = null");
 
-            commandStringBuilder.Append("})");
-
-            commandStringBuilder.AppendFormat("\nkeyf = javascript");
-
-            commandStringBuilder.Append("\nreduce = javascript");
-
-            commandStringBuilder.AppendFormat("\ninitial = {0}", initial.ToBsonDocument());
-
-            if (query != null)
-                commandStringBuilder.AppendFormat("\ncond = {0}", query.ToBsonDocument());
-
-            if (initial != null)
-                commandStringBuilder.AppendFormat("\ninitial = {0}", initial.ToBsonDocument());
-
-            if (finalize != null)
-                commandStringBuilder.Append("\nfinalize = javascript");
+            commandStringBuilder.AppendFormat("\nupsert = {0}", options.IsUpsert ? "true" : "false");
 
             string commandString = commandStringBuilder.ToString();
 
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Read);
+            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Update);
 
             return result;
         }
 
-        #endregion
+        public Task InsertOneAsync(TDefaultDocument document, CancellationToken cancellationToken = new CancellationToken())
+        {
+            var sw = new Stopwatch();
 
-        public override IEnumerable<WriteConcernResult> InsertBatch(Type nominalType, IEnumerable documents, MongoInsertOptions options)
+            sw.Start();
+            var result = _collection.InsertOneAsync(document, cancellationToken);
+            sw.Stop();
+
+            var commandStringBuilder = new StringBuilder(512);
+
+            commandStringBuilder.AppendFormat("db.{0}.insert(", Name);
+
+            // handle ensureIndex specially
+            if (Name == "system.indexes")
+                commandStringBuilder.AppendFormat("{0}", document.ToBsonDocument());
+            else
+                commandStringBuilder.Append("<document>");
+
+            commandStringBuilder.Append(")");
+
+            string commandString = commandStringBuilder.ToString();
+
+            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Create);
+
+            return result;
+        }
+
+        public Task InsertManyAsync(IEnumerable<TDefaultDocument> documents, InsertManyOptions options = null, CancellationToken cancellationToken = new CancellationToken())
         {
             var documentsList = documents.Cast<object>().ToList();
 
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.InsertBatch(nominalType, documentsList, options);
+            var result = _collection.InsertManyAsync(documents, options, cancellationToken);
             sw.Stop();
 
             var commandStringBuilder = new StringBuilder(512);
@@ -381,12 +323,13 @@ namespace StackExchange.Profiling.MongoDB
             return result;
         }
 
-        public override MapReduceResult MapReduce(MapReduceArgs args)
+        public async Task<IAsyncCursor<TResult>> MapReduceAsync<TResult>(BsonJavaScript map, BsonJavaScript reduce, MapReduceOptions<TDefaultDocument, TResult> options = null,
+                                            CancellationToken cancellationToken = new CancellationToken())
         {
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.MapReduce(args);
+            var result = await _collection.MapReduceAsync(map, reduce, options, cancellationToken);
             sw.Stop();
 
             string commandString = string.Format("db.{0}.mapReduce(<map function>, <reduce function>, options)", Name);
@@ -396,66 +339,30 @@ namespace StackExchange.Profiling.MongoDB
             return result;
         }
 
-        public override CommandResult ReIndex()
+        public async Task<ReplaceOneResult> ReplaceOneAsync(FilterDefinition<TDefaultDocument> filter, TDefaultDocument replacement, UpdateOptions options = null,
+                                    CancellationToken cancellationToken = new CancellationToken())
         {
+
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.ReIndex();
+            var result = await _collection.ReplaceOneAsync(filter, replacement, options, cancellationToken);
             sw.Stop();
 
-            string commandString = string.Format("db.{0}.reIndex()", Name);
+            string commandString = string.Format("db.{0}.replace(filter, replacement, options)", Name);
 
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Create);
+            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Read);
 
             return result;
         }
 
-        public override WriteConcernResult Remove(IMongoQuery query, RemoveFlags flags, WriteConcern writeConcern)
+        public async Task<UpdateResult> UpdateManyAsync(FilterDefinition<TDefaultDocument> filter, UpdateDefinition<TDefaultDocument> update, UpdateOptions options = null,
+                                    CancellationToken cancellationToken = new CancellationToken())
         {
             var sw = new Stopwatch();
 
             sw.Start();
-            var result = base.Remove(query, flags, writeConcern);
-            sw.Stop();
-
-            var commandStringBuilder = new StringBuilder(1024);
-
-            commandStringBuilder.AppendFormat("db.{0}.remove", Name);
-
-            if (query == null)
-            {
-                if ((flags & RemoveFlags.None) == RemoveFlags.None)
-                    commandStringBuilder.Append("()");
-                else if ((flags & RemoveFlags.Single) == RemoveFlags.Single)
-                    commandStringBuilder.Append("({}, true)");
-            }
-            else
-            {
-                commandStringBuilder.Append("(");
-                commandStringBuilder.AppendFormat("query");
-
-                if ((flags & RemoveFlags.Single) == RemoveFlags.Single)
-                    commandStringBuilder.Append(", true");
-
-                commandStringBuilder.Append(")");
-
-                commandStringBuilder.AppendFormat("\nquery = {0}", query.ToBsonDocument());
-            }
-
-            string commandString = commandStringBuilder.ToString();
-
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Create);
-
-            return result;
-        }
-
-        public override WriteConcernResult Update(IMongoQuery query, IMongoUpdate update, MongoUpdateOptions options)
-        {
-            var sw = new Stopwatch();
-
-            sw.Start();
-            var result = base.Update(query, update, options);
+            var result = await _collection.UpdateManyAsync(filter, update, options, cancellationToken);
             sw.Stop();
 
             var commandStringBuilder = new StringBuilder(1024);
@@ -464,19 +371,18 @@ namespace StackExchange.Profiling.MongoDB
 
             var optionsList = new List<string>();
 
-            if ((options.Flags & UpdateFlags.Upsert) == UpdateFlags.Upsert)
+            if ((options.IsUpsert))
                 optionsList.Add("upsert: true");
-
-            if ((options.Flags & UpdateFlags.Multi) == UpdateFlags.Multi)
-                optionsList.Add("multi: true");
+            
+            optionsList.Add("multi: true");
 
             if (optionsList.Any())
                 commandStringBuilder.AppendFormat("{{ {0} }}", string.Join(", ", optionsList));
 
             commandStringBuilder.Append(")");
 
-            if (query != null)
-                commandStringBuilder.AppendFormat("\nquery = {0}", query.ToBsonDocument());
+            if (filter != null)
+                commandStringBuilder.AppendFormat("\nquery = {0}", filter.ToBsonDocument());
             else
                 commandStringBuilder.Append("\nquery = {}");
 
@@ -490,6 +396,87 @@ namespace StackExchange.Profiling.MongoDB
             ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Update);
 
             return result;
+        }
+
+        public string Name
+        {
+            get { return _collection.CollectionNamespace.CollectionName; }
+        }
+
+        public async Task<UpdateResult> UpdateOneAsync(FilterDefinition<TDefaultDocument> filter, UpdateDefinition<TDefaultDocument> update, UpdateOptions options = null,
+                                   CancellationToken cancellationToken = new CancellationToken())
+        {
+
+            var sw = new Stopwatch();
+
+            sw.Start();
+            var result = await _collection.UpdateOneAsync(filter, update, options, cancellationToken);
+            sw.Stop();
+
+            var commandStringBuilder = new StringBuilder(1024);
+
+            commandStringBuilder.AppendFormat("db.{0}.update(query, update", Name);
+
+            var optionsList = new List<string>();
+
+            if (options != null && options.IsUpsert)
+                optionsList.Add("upsert: true");
+            
+            if (optionsList.Any())
+                commandStringBuilder.AppendFormat("{{ {0} }}", string.Join(", ", optionsList));
+
+            commandStringBuilder.Append(")");
+
+            if (filter != null)
+                commandStringBuilder.AppendFormat("\nquery = {0}", filter.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nquery = {}");
+
+            if (update != null)
+                commandStringBuilder.AppendFormat("\nupdate = {0}", update.ToBsonDocument());
+            else
+                commandStringBuilder.Append("\nupdate = {}");
+
+            string commandString = commandStringBuilder.ToString();
+
+            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Update);
+
+            return result;
+        }
+
+        public IMongoCollection<TDefaultDocument> WithReadPreference(ReadPreference readPreference)
+        {
+            return _collection.WithReadPreference(readPreference);
+        }
+
+        public IMongoCollection<TDefaultDocument> WithWriteConcern(WriteConcern writeConcern)
+        {
+            return _collection.WithWriteConcern(writeConcern);
+        }
+
+        public CollectionNamespace CollectionNamespace
+        {
+            get { return _collection.CollectionNamespace; }
+        }
+
+        public IMongoDatabase Database
+        {
+            get { return _collection.Database; }
+        }
+
+        public IBsonSerializer<TDefaultDocument> DocumentSerializer
+        {
+            get { return _collection.DocumentSerializer; }
+        }
+
+        public IMongoIndexManager<TDefaultDocument> Indexes
+        {
+            get { return _collection.Indexes; }
+        }
+
+        public MongoCollectionSettings Settings
+        {
+            get { return _collection.Settings; }
         }
     }
 }

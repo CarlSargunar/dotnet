@@ -30,61 +30,48 @@ namespace SampleWeb.Data
                 return _client;
             }
         }
-
-        private MongoServer _server;
-        public MongoServer Server
-        {
-            get
-            {
-                if (_server == null)
-                {
-                    _server = ProfiledMongoServer.Create(Client);
-                }
-                return _server;
-            }
-        }
-
-        private MongoDatabase _database;
-        public MongoDatabase Database
+        
+        private IMongoDatabase _database;
+        public IMongoDatabase Database
         {
             get
             {
                 if (_database == null)
                 {
-                    _database = Server.GetDatabase(DbName);
+                    _database = Client.GetDatabase(DbName);
                 }
                 return _database;
             }
         }
 
-        private MongoCollection _fooCollection;
-        public MongoCollection FooCollection
+        private IMongoCollection<BsonDocument> _fooCollection;
+        public IMongoCollection<BsonDocument> FooCollection
         {
             get
             {
                 if (_fooCollection == null)
                 {
-                    _fooCollection = Database.GetCollection("foo");
+                    _fooCollection = Database.GetCollection<BsonDocument>("foo");
                 }
                 return _fooCollection;
             }
         }
 
-        private MongoCollection _barCollection;
-        public MongoCollection BarCollection
+        private MongoDB.Driver.IMongoCollection<MongoDB.Bson.BsonDocument> _barCollection;
+        public IMongoCollection<BsonDocument> BarCollection
         {
             get
             {
                 if (_barCollection == null)
                 {
-                    _barCollection = Database.GetCollection("bar");
+                    _barCollection = Database.GetCollection<BsonDocument>("bar");
                 }
                 return _barCollection;
             }
         }
 
-        private MongoCollection<BazzItem> _bazzCollection;
-        public MongoCollection<BazzItem> BazzCollection
+        private IMongoCollection<BazzItem> _bazzCollection;
+        public IMongoCollection<BazzItem> BazzCollection
         {
             get
             {

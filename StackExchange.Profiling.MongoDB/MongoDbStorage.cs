@@ -1,10 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-
+using System.Threading.Tasks;
+using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
-using MongoDB.Driver.Builders;
 using StackExchange.Profiling.Storage;
 
 namespace StackExchange.Profiling.MongoDB
@@ -16,23 +16,22 @@ namespace StackExchange.Profiling.MongoDB
     {
         #region Collections
 
-        private MongoDatabase _db;
-        private MongoDatabase Db
+        private IMongoDatabase _db;
+        private IMongoDatabase Db
         {
             get
             {
                 if (_db == null)
                 {
                     var client = new MongoClient(ConnectionString);
-                    var server = client.GetServer();
-                    _db = server.GetDatabase("MiniProfiler");
+                    _db = client.GetDatabase("MiniProfiler");
                 }
                 return _db;
             }
         }
 
-        private MongoCollection<MiniProfilerPoco> _profilers;
-        private MongoCollection<MiniProfilerPoco> Profilers
+        private IMongoCollection<MiniProfilerPoco> _profilers;
+        private IMongoCollection<MiniProfilerPoco> Profilers
         {
             get
             {
@@ -44,8 +43,8 @@ namespace StackExchange.Profiling.MongoDB
             }
         }
 
-        private MongoCollection<TimingPoco> _timings;
-        private MongoCollection<TimingPoco> Timings
+        private IMongoCollection<TimingPoco> _timings;
+        private IMongoCollection<TimingPoco> Timings
         {
             get
             {
@@ -57,8 +56,8 @@ namespace StackExchange.Profiling.MongoDB
             }
         }
 
-        private MongoCollection<CustomTimingPoco> _customTimings;
-        private MongoCollection<CustomTimingPoco> CustomTimings
+        private IMongoCollection<CustomTimingPoco> _customTimings;
+        private IMongoCollection<CustomTimingPoco> CustomTimings
         {
             get
             {
@@ -70,8 +69,8 @@ namespace StackExchange.Profiling.MongoDB
             }
         }
 
-        private MongoCollection<ClientTimingPoco> _clientTimings;
-        private MongoCollection<ClientTimingPoco> ClientTimings
+        private IMongoCollection<ClientTimingPoco> _clientTimings;
+        private IMongoCollection<ClientTimingPoco> ClientTimings
         {
             get
             {
@@ -97,7 +96,7 @@ namespace StackExchange.Profiling.MongoDB
         /// Stores <param name="profiler"/> to MongoDB under its <see cref="MiniProfiler.Id"/>; 
         /// stores all child Timings and SqlTimings to their respective tables.
         /// </summary>
-        public override void Save(MiniProfiler profiler)
+        public override async void Save(MiniProfiler profiler)
         {
             var miniProfilerPoco = new MiniProfilerPoco
             {
@@ -113,17 +112,17 @@ namespace StackExchange.Profiling.MongoDB
                 ClientTimingsRedirectCounts = profiler.ClientTimings != null ? profiler.ClientTimings.RedirectCount : (int?) null
             };
 
-            var result = Profilers.Save(miniProfilerPoco, WriteConcern.Acknowledged);
+            var result = await Profilers.ReplaceOneAsync(Builders<MiniProfilerPoco>.Filter.Eq(c => c.Id, miniProfilerPoco.Id), miniProfilerPoco);
 
-            if (!result.UpdatedExisting)
+            if (result.ModifiedCount == 0)
             {
-                SaveTiming(profiler.Root);
+                await SaveTiming(profiler.Root);
             }
 
-            SaveClientTimings(profiler);
+            await SaveClientTimings(profiler);
         }
 
-        private void SaveTiming(Timing timing)
+        private async Task SaveTiming(Timing timing)
         {
             var rootTiming = new TimingPoco
             {
@@ -134,13 +133,13 @@ namespace StackExchange.Profiling.MongoDB
                 DurationMilliseconds = (double)timing.DurationMilliseconds
             };
 
-            Timings.Insert(rootTiming);
+            await Timings.InsertOneAsync(rootTiming);
 
             if (timing.HasChildren)
             {
                 foreach (var child in timing.Children)
                 {
-                    SaveTiming(child);
+                    await SaveTiming(child);
                 }
             }
 
@@ -148,12 +147,12 @@ namespace StackExchange.Profiling.MongoDB
             {
                 foreach (var customTimingsKV in timing.CustomTimings)
                 {
-                    SaveCustomTimings(timing, customTimingsKV);
+                    await SaveCustomTimings(timing, customTimingsKV);
                 }
             }
         }
 
-        private void SaveClientTimings(MiniProfiler profiler)
+        private async Task SaveClientTimings(MiniProfiler profiler)
         {
             if (profiler.ClientTimings == null || profiler.ClientTimings.Timings == null || !profiler.ClientTimings.Timings.Any())
                 return;
@@ -175,11 +174,11 @@ namespace StackExchange.Profiling.MongoDB
                     Duration = (double)clientTiming.Duration
                 };
 
-                ClientTimings.Save(clientTimingPoco);
+                await ClientTimings.ReplaceOneAsync(Builders<ClientTimingPoco>.Filter.Eq(c => c.Id, clientTiming.Id), clientTimingPoco);
             }
         }
 
-        private void SaveCustomTimings(Timing timing, KeyValuePair<string, List<CustomTiming>> customTimingsKV)
+        private async Task SaveCustomTimings(Timing timing, KeyValuePair<string, List<CustomTiming>> customTimingsKV)
         {
             var key = customTimingsKV.Key;
             var value = customTimingsKV.Value;
@@ -199,7 +198,7 @@ namespace StackExchange.Profiling.MongoDB
                     FirstFetchDurationMilliseconds = customTiming.FirstFetchDurationMilliseconds
                 };
 
-                CustomTimings.Insert(customTimingPoco);
+                await CustomTimings.InsertOneAsync(customTimingPoco);
             }
         }
 
@@ -208,7 +207,7 @@ namespace StackExchange.Profiling.MongoDB
         /// </summary>
         public override MiniProfiler Load(Guid id)
         {
-            var profilerPoco = Profilers.FindOne(Query<MiniProfilerPoco>.EQ(poco => poco.Id, id));
+            var profilerPoco = Profilers.Find(Builders<MiniProfilerPoco>.Filter.Eq(poco => poco.Id, id)).FirstOrDefaultAsync().Result;
             var miniProfiler = ProfilerPocoToProfiler(profilerPoco);
 
             if (miniProfiler != null)
@@ -230,7 +229,7 @@ namespace StackExchange.Profiling.MongoDB
 
         private Timing LoadTiming(Guid id)
         {
-            var timingPoco = Timings.FindOne(Query<TimingPoco>.EQ(poco => poco.Id, id));
+            var timingPoco = Timings.Find(Builders<TimingPoco>.Filter.Eq(poco => poco.Id, id)).FirstOrDefaultAsync().Result;
             var timing = TimingPocoToTiming(timingPoco);
 
             if (timing != null)
@@ -245,9 +244,9 @@ namespace StackExchange.Profiling.MongoDB
         private List<Timing> LoadChildrenTimings(Guid parentId)
         {
             var childrenTimings =
-                    Timings.Find(Query<TimingPoco>.EQ(poco => poco.ParentTimingId, parentId))
-                        .SetSortOrder(SortBy<TimingPoco>.Ascending(poco => poco.StartMilliseconds))
-                        .ToList()
+                    Timings.Find(Builders<TimingPoco>.Filter.Eq(poco => poco.ParentTimingId, parentId))
+                        .Sort(Builders<TimingPoco>.Sort.Ascending(poco => poco.StartMilliseconds))
+                        .ToListAsync().Result
                         .Select(TimingPocoToTiming)
                         .ToList();
 
@@ -263,8 +262,8 @@ namespace StackExchange.Profiling.MongoDB
         private Dictionary<string, List<CustomTiming>> LoadCustomTimings(Guid timingId)
         {
             var customTimingPocos = CustomTimings
-                .Find(Query<CustomTimingPoco>.EQ(poco => poco.TimingId, timingId))
-                .ToList();
+                .Find(Builders<CustomTimingPoco>.Filter.Eq(poco => poco.TimingId, timingId))
+                .ToListAsync().Result;
 
             return customTimingPocos
                 .GroupBy(poco => poco.Key)
@@ -276,8 +275,8 @@ namespace StackExchange.Profiling.MongoDB
         private ClientTimings LoadClientTimings(MiniProfiler profiler)
         {
             var timings = ClientTimings
-                .Find(Query<ClientTimingPoco>.EQ(poco => poco.MiniProfilerId, profiler.Id))
-                .ToList()
+                .Find(Builders<ClientTimingPoco>.Filter.Eq(poco => poco.MiniProfilerId, profiler.Id))
+                .ToListAsync().Result
                 .Select(ClientTimingPocoToClientTiming)
                 .ToList();
 
@@ -366,8 +365,8 @@ namespace StackExchange.Profiling.MongoDB
         /// </summary>
         public override void SetUnviewed(string user, Guid id)
         {
-            Profilers.Update(Query.EQ("_id", id.ToString()),
-                Update<MiniProfilerPoco>.Set(poco => poco.HasUserViewed, false));
+            Profilers.UpdateOneAsync(Builders<MiniProfilerPoco>.Filter.Eq("_id", id.ToString()),
+                Builders<MiniProfilerPoco>.Update.Set(poco => poco.HasUserViewed, false));
         }
 
         /// <summary>
@@ -375,8 +374,8 @@ namespace StackExchange.Profiling.MongoDB
         /// </summary>
         public override void SetViewed(string user, Guid id)
         {
-            Profilers.Update(Query.EQ("_id", id.ToString()),
-                Update<MiniProfilerPoco>.Set(poco => poco.HasUserViewed, true));
+            Profilers.UpdateOneAsync(Builders<MiniProfilerPoco>.Filter.Eq("_id", id.ToString()),
+                Builders<MiniProfilerPoco>.Update.Set(poco => poco.HasUserViewed, true));
         }
 
         /// <summary>
@@ -385,27 +384,27 @@ namespace StackExchange.Profiling.MongoDB
         /// <param name="user">User identified by the current <see cref="MiniProfiler.Settings.UserProvider"/>.</param>
         public override List<Guid> GetUnviewedIds(string user)
         {
-            var query = Query.And(
-                    Query<MiniProfilerPoco>.EQ(p => p.User, user),
-                    Query<MiniProfilerPoco>.EQ(p => p.HasUserViewed, false));
-            var guids = Profilers.Find(query).Select(p => p.Id).ToList();
+            var query = Builders<MiniProfilerPoco>.Filter.And(
+                    Builders<MiniProfilerPoco>.Filter.Eq(p => p.User, user),
+                    Builders<MiniProfilerPoco>.Filter.Eq(p => p.HasUserViewed, false));
+            var guids = Profilers.Find(query).ToListAsync().Result.Select(p => p.Id).ToList();
             return guids;
         }
 
         public override IEnumerable<Guid> List(int maxResults, DateTime? start = null, DateTime? finish = null, ListResultsOrder orderBy = ListResultsOrder.Descending)
         {
-            IMongoQuery query = null;
+            FilterDefinition<MiniProfilerPoco> query = null;
 
             if (start != null)
             {
-                query = Query.And(Query.GT("Started", (DateTime)start));
+                query = Builders<MiniProfilerPoco>.Filter.And(Builders<MiniProfilerPoco>.Filter.Gt("Started", (DateTime)start));
             }
             if (finish != null)
             {
-                query = Query.And(Query.LT("Started", (DateTime)finish));
+                query = Builders<MiniProfilerPoco>.Filter.And(Builders<MiniProfilerPoco>.Filter.Lt("Started", (DateTime)finish));
             }
 
-            var profilers = Profilers.Find(query).Take(maxResults);
+            var profilers = Profilers.Find(query).ToListAsync().Result.Take(maxResults);
 
             profilers = orderBy == ListResultsOrder.Descending
                 ? profilers.OrderByDescending(p => p.Started)

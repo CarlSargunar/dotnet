@@ -1,97 +1,124 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using MongoDB.Bson;
-using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using StackExchange.Profiling.MongoDB.Utils;
 
 namespace StackExchange.Profiling.MongoDB
 {
-    public class ProfiledMongoCursor<TDocument> : MongoCursor<TDocument>
+    public class ProfiledMongoCursor<TDocument, TProjection> : IAsyncCursor<TProjection>
     {
-        public ProfiledMongoCursor(MongoCollection collection, IMongoQuery query, ReadPreference readPreference,
-            IBsonSerializer serializer, IBsonSerializationOptions serializationOptions)
-            : base(collection, query, readPreference, serializer, serializationOptions)
+        private readonly IAsyncCursor<TProjection> _source;
+        private readonly IMongoCollection<TDocument> _collection;
+        private readonly FilterDefinition<TDocument> _filter;
+        private readonly FieldDefinition<TProjection> _fields;
+        private readonly SortDefinition<TDocument> _sort;
+        private readonly int? _skip;
+        private readonly int? _limit;
+        private readonly Stopwatch _sw;
+        private bool _enumStarted;
+
+        public ProfiledMongoCursor(
+            IAsyncCursor<TProjection> source, 
+            IMongoCollection<TDocument> collection, 
+            FilterDefinition<TDocument> filter, 
+            FieldDefinition<TProjection> fields,
+            SortDefinition<TDocument> sort,
+            int? skip,
+            int? limit)
         {
+            _source = source;
+            _collection = collection;
+            _filter = filter;
+            _fields = fields;
+            _sort = sort;
+            _skip = skip;
+            _limit = limit;
+
+            _sw = new Stopwatch();
+        }
+        
+        public void Dispose()
+        {
+            _source.Dispose();
         }
 
-        public override BsonDocument Explain()
+        public async Task<bool> MoveNextAsync(CancellationToken cancellationToken = new CancellationToken())
         {
-            var sw = new Stopwatch();
+            if (!_enumStarted)
+            {
+                _enumStarted = true;
+                _sw.Start();
+            }
 
-            sw.Start();
-            var result = base.Explain();
-            sw.Stop();
+            var result = await _source.MoveNextAsync(cancellationToken);
 
-            string commandString = Query != null
-                ? string.Format("{0}.find(query).explain()\n\nquery = {1}", Collection.Name, Query.ToBsonDocument())
-                : string.Format("{0}.find().explain()", Collection.Name);
+            if (!result)
+            {
+                _sw.Stop();
 
-            ProfilerUtils.AddMongoTiming(commandString, sw.ElapsedMilliseconds, ExecuteType.Command);
+                OnEnumerationEnded(new EnumerationEndedEventArgs { Elapsed = _sw.Elapsed });
+            }
 
             return result;
         }
 
-        public override IEnumerator<TDocument> GetEnumerator()
+        public IEnumerable<TProjection> Current
         {
-            var underlyingEnumerator = base.GetEnumerator();
-            var profiledEnumerator = new ProfiledEnumerator<TDocument>(underlyingEnumerator);
-
-            profiledEnumerator.EnumerationEnded += ProfiledEnumeratorOnEnumerationEnded;
-
-            return profiledEnumerator;
+            get { return _source.Current; }
         }
 
-        private void ProfiledEnumeratorOnEnumerationEnded(object sender, ProfiledEnumerator<TDocument>.EnumerationEndedEventArgs enumerationEndedEventArgs)
+
+        protected virtual void OnEnumerationEnded(EnumerationEndedEventArgs enumerationEndedEventArgs)
         {
-            BsonValue hint = null, orderBy = null;
-
-            var hasHint = Options != null && Options.TryGetValue("$hint", out hint);
-            var hasOrderBy = Options != null && Options.TryGetValue("$orderby", out orderBy);
-
             var commandStringBuilder = new StringBuilder(1024);
 
-            commandStringBuilder.Append(Collection.Name);
+            if (_collection != null)
+            {
+                commandStringBuilder.Append(_collection.CollectionNamespace.CollectionName);
+            }
             commandStringBuilder.Append(".find(");
 
-            if (Query != null)
+            if (_filter != null)
                 commandStringBuilder.Append("query");
 
-            if (Fields != null)
+            if (_fields != null)
                 commandStringBuilder.Append(",fields");
 
             commandStringBuilder.Append(")");
 
-            if (hasOrderBy)
+            if (_sort != null)
                 commandStringBuilder.Append(".sort(orderBy)");
 
-            if (hasHint)
-                commandStringBuilder.Append(".hint(hint)");
+            if (_skip != 0)
+                commandStringBuilder.AppendFormat(".skip({0})", _skip);
 
-            if (Skip != 0)
-                commandStringBuilder.AppendFormat(".skip({0})", Skip);
+            if (_limit != 0)
+                commandStringBuilder.AppendFormat(".limit({0})", _limit);
 
-            if (Limit != 0)
-                commandStringBuilder.AppendFormat(".limit({0})", Limit);
+            if (_filter != null)
+                commandStringBuilder.AppendFormat("\nquery = {0}", _filter.ToBsonDocument());
 
-            if (Query != null)
-                commandStringBuilder.AppendFormat("\nquery = {0}", Query.ToBsonDocument());
+            if (_fields != null)
+                commandStringBuilder.AppendFormat("\nfields = {0}", _fields.ToBsonDocument());
 
-            if (Fields != null)
-                commandStringBuilder.AppendFormat("\nfields = {0}", Fields.ToBsonDocument());
-
-            if (hasOrderBy)
-                commandStringBuilder.AppendFormat("\norderBy = {0}", orderBy.ToBsonDocument());
-
-            if (hasHint)
-                commandStringBuilder.AppendFormat("\nhint = {0}", hint.ToBsonDocument());
+            if (_sort != null)
+                commandStringBuilder.AppendFormat("\norderBy = {0}", _sort.ToBsonDocument());
 
             // TODO: implement other options printout if needed
 
             string commandString = commandStringBuilder.ToString();
 
-            ProfilerUtils.AddMongoTiming(commandString, (long) enumerationEndedEventArgs.Elapsed.TotalMilliseconds, ExecuteType.Read);
+            ProfilerUtils.AddMongoTiming(commandString, (long)enumerationEndedEventArgs.Elapsed.TotalMilliseconds, ExecuteType.Read);
+        }
+
+        public class EnumerationEndedEventArgs : EventArgs
+        {
+            public TimeSpan Elapsed { get; set; }
         }
     }
 }
